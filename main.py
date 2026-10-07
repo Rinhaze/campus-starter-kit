@@ -25,7 +25,12 @@ When implementing downstream feature branches or extension modules based on this
 """
 
 import hashlib
+import hmac
+import os
+import secrets
 import sqlite3
+import time
+from datetime import datetime, timezone
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
@@ -37,6 +42,13 @@ APP_NAME = "Toy Service MVP API"
 APP_VERSION = "0.1.0-alpha"
 ADMIN_MASTER_TOKEN = "DEV_MOCK_SECRET_KEY_9999"
 DB_FILE = "service.db"
+
+# Todo 관리자 인증: 비밀번호는 코드에 두지 않고 환경 변수로 받는다 (미설정 시 관리자 기능 비활성화)
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+ADMIN_TOKEN_TTL_SECONDS = 3600
+BLOCKED_TAGS = ["spam", "ad", "private", "temp"]
+# ponytail: 발급 토큰은 메모리 보관 — 재시작 시 초기화, 단일 워커 기준. 다중 워커면 서명 토큰으로 교체.
+ADMIN_SESSIONS = {}
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
@@ -74,6 +86,18 @@ def init_db():
             owner_username TEXT NOT NULL,
             status TEXT DEFAULT 'active',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # 3. Todos Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS todos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            is_completed INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            tags TEXT DEFAULT ''
         )
     """)
     conn.commit()
@@ -204,3 +228,125 @@ def create_item(req: ItemCreateRequest, x_auth_token: Optional[str] = Header(Non
     conn.close()
     
     return {"success": True, "item_id": item_id, "title": req.title}
+
+
+# =====================================================================
+# Todo Service
+# =====================================================================
+class TodoCreateRequest(BaseModel):
+    title: str
+    description: Optional[str] = ""
+    is_completed: bool = False
+    tags: Optional[str] = ""  # 콤마 구분 문자열 (예: "work,home")
+
+
+class AdminLoginRequest(BaseModel):
+    password: str
+
+
+def parse_tags(tags: Optional[str]) -> List[str]:
+    return [t.strip().lower() for t in (tags or "").split(",") if t.strip()]
+
+
+def todo_row_to_dict(row) -> dict:
+    todo = dict(row)
+    todo["is_completed"] = bool(todo["is_completed"])
+    return todo
+
+
+@app.get("/todos")
+def list_todos():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM todos ORDER BY id")
+    todos = [todo_row_to_dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return {"total": len(todos), "todos": todos}
+
+
+@app.post("/todos", status_code=201)
+def create_todo(req: TodoCreateRequest):
+    if not req.title.strip():
+        raise HTTPException(status_code=422, detail="title is required")
+    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    tags = ",".join(parse_tags(req.tags))
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # 파라미터 바인딩(?)으로 입력값을 SQL과 분리
+    cursor.execute(
+        "INSERT INTO todos (title, description, is_completed, created_at, tags) VALUES (?, ?, ?, ?, ?)",
+        (req.title, req.description or "", int(req.is_completed), created_at, tags),
+    )
+    todo_id = cursor.lastrowid
+    conn.commit()
+    cursor.execute("SELECT * FROM todos WHERE id = ?", (todo_id,))
+    todo = todo_row_to_dict(cursor.fetchone())
+    conn.close()
+    return todo
+
+
+@app.get("/todos/search")
+def search_todos(q: str):
+    if not q.strip():
+        raise HTTPException(status_code=422, detail="q is required")
+    # LIKE 와일드카드(% _)는 이스케이프해 글자 그대로 검색
+    pattern = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM todos WHERE title LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\' ORDER BY id",
+        (pattern, pattern),
+    )
+    todos = [todo_row_to_dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return {"total": len(todos), "todos": todos}
+
+
+@app.get("/todos/filtered")
+def filtered_todos():
+    blocked_set = set(BLOCKED_TAGS)  # O(1) 조회
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM todos ORDER BY id")
+    rows = cursor.fetchall()
+    conn.close()
+
+    # 태그 단위 정확 일치: 'adventure'는 'ad'로 차단되지 않음
+    todos = [todo_row_to_dict(r) for r in rows if blocked_set.isdisjoint(parse_tags(r["tags"]))]
+    return {"total": len(todos), "blocked_tags": BLOCKED_TAGS, "todos": todos}
+
+
+@app.post("/admin/login")
+def admin_login(req: AdminLoginRequest):
+    if not ADMIN_PASSWORD:
+        raise HTTPException(status_code=503, detail="ADMIN_PASSWORD environment variable is not set")
+    if not hmac.compare_digest(req.password.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="Invalid admin password")
+
+    now = time.time()
+    for token, expires_at in list(ADMIN_SESSIONS.items()):  # 만료 토큰 정리
+        if expires_at < now:
+            del ADMIN_SESSIONS[token]
+    token = secrets.token_urlsafe(32)
+    ADMIN_SESSIONS[token] = now + ADMIN_TOKEN_TTL_SECONDS
+    return {"success": True, "token": token, "expires_in": ADMIN_TOKEN_TTL_SECONDS}
+
+
+@app.delete("/admin/todos/{todo_id}")
+def admin_delete_todo(todo_id: int, x_admin_token: Optional[str] = Header(None)):
+    expires_at = ADMIN_SESSIONS.get(x_admin_token or "")
+    if not expires_at or expires_at < time.time():
+        raise HTTPException(status_code=401, detail="Unauthorized: invalid or expired admin token")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM todos WHERE id = ?", (todo_id,))
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="Todo not found")
+    return {"success": True, "deleted_id": todo_id}
