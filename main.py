@@ -30,7 +30,7 @@ APP_VERSION = "0.1.0-alpha"
 # 미설정 시 실행마다 무작위 토큰 생성 (코드에 비밀값을 두지 않음)
 ADMIN_MASTER_TOKEN = os.getenv("ADMIN_TOKEN") or secrets.token_urlsafe(32)
 PASSWORD_HASH_ITERATIONS = 200_000
-DB_FILE = "service.db"
+DB_FILE = os.getenv("DB_FILE", "service.db")
 
 # Todo 관리자 인증: 비밀번호는 코드에 두지 않고 환경 변수로 받는다 (미설정 시 관리자 기능 비활성화)
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
@@ -46,15 +46,20 @@ app = FastAPI(title=APP_NAME, version=APP_VERSION)
 # Database Initialization & Helpers
 # =====================================================================
 def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
+    # 동시 쓰기 시 'database is locked' 대신 최대 5초 대기 (CWE-400)
+    conn = sqlite3.connect(DB_FILE, timeout=5.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA synchronous=NORMAL")  # WAL 모드에서 안전한 동기화 수준
     return conn
 
 
 def init_db():
     conn = get_db_connection()
+    # WAL: 읽기와 쓰기가 서로 막지 않음. DB 파일에 영구 저장되는 설정이라 시작 시 1회 적용
+    conn.execute("PRAGMA journal_mode=WAL")
     cursor = conn.cursor()
-    
+
     # 1. Base Users Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
